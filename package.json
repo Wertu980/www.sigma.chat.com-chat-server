@@ -1,0 +1,22 @@
+{
+  "name": "chat-server",
+  "version": "1.0.0",
+  "main": "chat-server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node chat-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^9.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.7.0"
+  },
+  "description": "",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
