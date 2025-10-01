@@ -2,208 +2,202 @@
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
-const cors = require('cors');
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
-/* ---------------- Config ---------------- */
-const PORT           = Number(process.env.CHAT_PORT || 4000);
-const JWT_SECRET     = process.env.JWT_SECRET || 'dev_secret';
-const CORS_ORIGIN    = process.env.CORS_ORIGIN || '*';
-const SERVER_TOKEN   = process.env.SERVER_TOKEN || ''; // optional for /emit
-const RETENTION_MS   = Number(process.env.RETENTION_MS || 24*60*60*1000); // 24h
-const CLEAN_EVERY_MS = Number(process.env.CLEAN_EVERY_MS || 10*60*1000);   // 10m
+const PORT = Number(process.env.CHAT_PORT || process.env.PORT || 4000);
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const RETENTION_MS = Number(process.env.RETENTION_MS || 24 * 60 * 60 * 1000); // 24h
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 10 * 60 * 1000); // 10m
 
-/* ---------------- App / IO ---------------- */
-const app = express();
-app.use(cors({ origin: CORS_ORIGIN }));
-app.use(express.json());
+/* ---------- Files ---------- */
+const DATA_DIR = path.join(__dirname, 'data');
+const MSG_FILE = path.join(DATA_DIR, 'chat.json');             // [{id,from,to,content,ts}]
+const UND_FILE = path.join(DATA_DIR, 'undelivered.json');      // { userId: [message,...] }
+const CONV_FILE = path.join(DATA_DIR, 'conversations.json');   // { userId: [{peerId,peerName,ts}] }
 
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: CORS_ORIGIN }});
-
-/* ---------------- File storage ---------------- */
-const CHAT_FILE = path.join(__dirname, 'data', 'chat', 'chat.json');
-fs.mkdirSync(path.dirname(CHAT_FILE), { recursive: true });
-if (!fs.existsSync(CHAT_FILE)) fs.writeFileSync(CHAT_FILE, '[]', 'utf8');
-
-function loadMessages() {
-  try { return JSON.parse(fs.readFileSync(CHAT_FILE, 'utf8') || '[]'); }
-  catch { return []; }
+function ensureFile(file, init) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(file)) fs.writeFileSync(file, init, 'utf8');
 }
-function saveMessages(list) {
-  fs.writeFileSync(CHAT_FILE, JSON.stringify(list || [], null, 2));
+ensureFile(MSG_FILE, '[]');
+ensureFile(UND_FILE, '{}');
+ensureFile(CONV_FILE, '{}');
+
+const readJson = (file, fallback) => {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8') || fallback); }
+  catch { return JSON.parse(fallback); }
+};
+const writeJson = (file, obj) => fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+
+/* ---------- Stores ---------- */
+function loadMessages() { return readJson(MSG_FILE, '[]'); }
+function saveMessages(list) { writeJson(MSG_FILE, list); }
+function addMessage(msg) {
+  const list = loadMessages(); list.push(msg); saveMessages(list);
 }
-function addMessage(m) {
+function cleanupMessages() {
+  const cutoff = Date.now() - RETENTION_MS;
   const list = loadMessages();
-  list.push(m);
-  saveMessages(list);
+  const keep = list.filter(m => new Date(m.ts).getTime() > cutoff);
+  if (keep.length !== list.length) saveMessages(keep);
 }
-function cleanup() {
-  const now = Date.now();
-  let list = loadMessages();
-  const before = list.length;
-  list = list.filter(m => now - new Date(m.ts).getTime() < RETENTION_MS);
-  if (before !== list.length) {
-    console.log(`🧹 cleanup: removed ${before - list.length} expired`);
-    saveMessages(list);
-  }
-}
-setInterval(cleanup, CLEAN_EVERY_MS);
 
-/* ---------------- Helpers ---------------- */
-function verifyHttp(req, res, next) {
-  // Allow internal calls via x-server-token (optional)
-  const st = req.headers['x-server-token'];
-  if (st && SERVER_TOKEN && st === SERVER_TOKEN) {
-    req.caller = { id: 'server', type: 'server' };
-    return next();
+function loadUndelivered() { return readJson(UND_FILE, '{}'); }
+function saveUndelivered(map) { writeJson(UND_FILE, map); }
+function queueUndelivered(toUserId, msg) {
+  const map = loadUndelivered();
+  if (!map[toUserId]) map[toUserId] = [];
+  map[toUserId].push(msg);
+  saveUndelivered(map);
+}
+function drainUndelivered(toUserId) {
+  const map = loadUndelivered();
+  const list = map[toUserId] || [];
+  map[toUserId] = [];
+  saveUndelivered(map);
+  return list;
+}
+
+function loadConvs() { return readJson(CONV_FILE, '{}'); }
+function saveConvs(obj) { writeJson(CONV_FILE, obj); }
+function touchConversation(userId, peerId, peerName) {
+  const convs = loadConvs();
+  if (!convs[userId]) convs[userId] = [];
+  const arr = convs[userId];
+  const now = Date.now();
+
+  const i = arr.findIndex(x => x.peerId === peerId);
+  if (i === -1) arr.unshift({ peerId, peerName: peerName || '', ts: now });
+  else {
+    // move to top + update name/time
+    const updated = { ...arr[i], peerName: peerName || arr[i].peerName, ts: now };
+    arr.splice(i, 1);
+    arr.unshift(updated);
   }
-  const hdr = req.headers.authorization || '';
-  const token = hdr.replace(/^Bearer\s+/i, '');
-  if (!token) return res.status(401).json({ error: 'missing_token' });
+  saveConvs(convs);
+}
+
+/* ---------- App / IO ---------- */
+const app = express();
+app.use(express.json());
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: CORS_ORIGIN } });
+
+/* ---------- Auth (HTTP & Socket) ---------- */
+function verifyToken(bearer) {
+  const token = (bearer || '').replace(/^Bearer\s+/i, '');
+  if (!token) throw new Error('missing_token');
+  return jwt.verify(token, JWT_SECRET);
+}
+function httpAuth(req, res, next) {
   try {
-    req.caller = jwt.verify(token, JWT_SECRET);
-    return next();
+    const payload = verifyToken(req.headers.authorization || '');
+    req.user = payload;
+    next();
   } catch (e) {
     return res.status(401).json({ error: 'invalid_token', details: e.message });
   }
 }
-
-/* ---------------- Socket auth ---------------- */
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-  if (!token) return next(new Error('missing_token'));
   try {
-    socket.user = jwt.verify(token, JWT_SECRET);
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    const payload = verifyToken(`Bearer ${token}`);
+    socket.user = payload;
     next();
-  } catch (e) {
-    next(new Error('invalid_token'));
-  }
+  } catch (e) { next(new Error('invalid_token')); }
 });
 
-/* ---------------- Presence (very simple) ---------------- */
-const online = new Set(); // userId set
-
-function broadcastPresence(userId, state) {
-  // emit to everyone who cares; simplest: broadcast globally
-  io.emit('presence', { userId, state }); // 'online' | 'offline'
-}
-
-/* ---------------- Socket handlers ---------------- */
+/* ---------- Socket events ---------- */
 io.on('connection', (socket) => {
-  const user = socket.user;
-  if (!user?.id) return socket.disconnect();
+  const me = socket.user;
+  if (!me?.id) return socket.disconnect();
 
-  const myRoom = `user:${user.id}`;
-  socket.join(myRoom);
-  online.add(user.id);
-  broadcastPresence(user.id, 'online');
-  console.log(`🔵 CONNECT ${user.id}`);
+  const room = `user:${me.id}`;
+  socket.join(room);
+  console.log(`🔵 CONNECT ${me.id}`);
 
-  // 1) On connect, dump recent messages involving this user (creates first-time chats)
-  const all = loadMessages();
-  const cutoff = Date.now() - RETENTION_MS;
-  const recent = all.filter(m =>
-    new Date(m.ts).getTime() >= cutoff && (m.to === user.id || m.from === user.id)
-  );
-  socket.emit('recent', { items: recent }); // client stores & touches conversations
+  // 1) Drain any queued undelivered messages
+  const queued = drainUndelivered(me.id);
+  if (queued.length) {
+    queued.forEach(m => socket.emit('message', m));
+  }
+  // 2) Tell clients I'm online (optional)
+  io.to(room).emit('presence', { userId: me.id, status: 'online' });
 
-  // 2) Pull sync (client can request everything after a timestamp)
-  socket.on('sync', ({ since }) => {
-    const sinceMs = typeof since === 'number' ? since : Date.parse(since || 0);
-    const all2 = loadMessages();
-    const items = all2.filter(m =>
-      (m.to === user.id || m.from === user.id) &&
-      new Date(m.ts).getTime() > (sinceMs || 0)
-    );
-    socket.emit('recent', { items });
-  });
-
-  // 3) Send message
-  socket.on('message', (payload = {}) => {
-    const { to, content, tempId } = payload;
+  // Handle send
+  socket.on('message', (payload) => {
+    const { to, content, tempId, peerName } = payload || {};
     if (!to || !content) return;
+
     const msg = {
       id: uuidv4(),
-      from: user.id,
+      from: me.id,
       to,
       content,
       ts: new Date().toISOString()
     };
+
+    // persist
     addMessage(msg);
 
-    // deliver to recipient (even if it's their first conversation)
-    io.to(`user:${to}`).emit('message', msg);
+    // ensure both conversation lists updated (so first-time chats appear)
+    touchConversation(me.id, to, peerName || '');
+    touchConversation(to, me.id, me.name || '');
 
-    // ack back to sender
+    // deliver now if recipient is connected, else queue
+    const recipientRoom = `user:${to}`;
+    const roomSize = io.sockets.adapter.rooms.get(recipientRoom)?.size || 0;
+
+    if (roomSize > 0) {
+      io.to(recipientRoom).emit('message', msg);
+    } else {
+      queueUndelivered(to, msg);
+    }
+
+    // ACK back to sender
     socket.emit('message:sent', { tempId: tempId || null, serverId: msg.id, ts: msg.ts });
-    console.log(`💬 ${msg.from} -> ${msg.to}: ${msg.content}`);
+    console.log(`💬 ${msg.from} -> ${msg.to}: ${msg.content}${roomSize ? '' : ' (queued)'}`);
   });
 
   socket.on('disconnect', () => {
-    online.delete(user.id);
-    broadcastPresence(user.id, 'offline');
-    console.log(`🔴 DISCONNECT ${user.id}`);
+    console.log(`🔴 DISCONNECT ${me.id}`);
+    // optional presence event
+    io.to(room).emit('presence', { userId: me.id, status: 'offline' });
   });
 });
 
-/* ---------------- HTTP endpoints ---------------- */
+/* ---------- HTTP APIs ---------- */
+// Health
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// last message per peer for a user (seed Home list)
-app.get('/conversations', verifyHttp, (req, res) => {
-  const userId = String(req.query.userId || '');
-  if (!userId) return res.status(400).json({ error: 'missing_user' });
-
-  const cutoff = Date.now() - RETENTION_MS;
-  const msgs = loadMessages().filter(m =>
-    new Date(m.ts).getTime() >= cutoff && (m.to === userId || m.from === userId)
-  );
-
-  const map = new Map(); // peerId -> msg
-  for (const m of msgs) {
-    const peerId = m.from === userId ? m.to : m.from;
-    const prev = map.get(peerId);
-    if (!prev || new Date(m.ts).getTime() > new Date(prev.ts).getTime()) {
-      map.set(peerId, m);
-    }
-  }
-  const items = Array.from(map.entries()).map(([peerId, m]) => ({
-    peerId,
-    last: { id: m.id, from: m.from, to: m.to, content: m.content, ts: m.ts }
-  }));
-  res.json({ ok: true, items });
+// Conversations for Home
+app.get('/conversations/:userId', httpAuth, (req, res) => {
+  const convs = loadConvs();
+  res.json(convs[req.params.userId] || []);
 });
 
-// pull all messages between A and B within retention (for opening thread cold)
-app.get('/messages', verifyHttp, (req, res) => {
+// History between two users (within retention)
+app.get('/messages', httpAuth, (req, res) => {
   const { userA, userB } = req.query;
   if (!userA || !userB) return res.status(400).json({ error: 'missing_params' });
-  const cutoff = Date.now() - RETENTION_MS;
-  const items = loadMessages().filter(m =>
-    new Date(m.ts).getTime() >= cutoff &&
-    ((m.from === userA && m.to === userB) || (m.from === userB && m.to === userA))
-  );
-  res.json({ ok: true, items });
+  const now = Date.now();
+  const msgs = loadMessages().filter(m => {
+    const inPair = (m.from === userA && m.to === userB) || (m.from === userB && m.to === userA);
+    const fresh = now - new Date(m.ts).getTime() <= RETENTION_MS;
+    return inPair && fresh;
+  });
+  res.json({ ok: true, messages: msgs });
 });
 
-// emit a message via HTTP (server-to-user or service use)
-app.post('/emit', verifyHttp, (req, res) => {
-  const { to, content } = req.body || {};
-  if (!to || !content) return res.status(400).json({ error: 'missing_fields' });
+/* ---------- Cleanup timer ---------- */
+setInterval(cleanupMessages, CLEANUP_INTERVAL_MS);
 
-  const from = req.caller?.id || 'server';
-  const msg = { id: uuidv4(), from, to, content, ts: new Date().toISOString() };
-  addMessage(msg);
-  io.to(`user:${to}`).emit('message', msg);
-  res.json({ ok: true, message: msg });
-});
-
-/* ---------------- Start ---------------- */
+/* ---------- Start ---------- */
 server.listen(PORT, () => {
-  console.log(`🚀 Chat server listening on ${PORT}`);
+  console.log(`🚀 Chat server running on ${PORT}`);
 });
