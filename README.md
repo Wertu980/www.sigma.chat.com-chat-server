@@ -1,1 +1,1 @@
-# www.sigma.chat.com-chat-server
+# https://wwwsigmachatcom.vercel.app
