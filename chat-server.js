@@ -8,17 +8,22 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
-const PORT = Number(process.env.CHAT_PORT || process.env.PORT || 4000);
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const RETENTION_MS = Number(process.env.RETENTION_MS || 24 * 60 * 60 * 1000); // 24h
-const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 10 * 60 * 1000); // 10m
+/* ---------- Defaults / env ---------- */
+const DEFAULTS = {
+  PORT: Number(process.env.CHAT_PORT || process.env.PORT || 4000),
+  JWT_SECRET: process.env.JWT_SECRET || 'dev_secret',
+  CORS_ORIGIN: process.env.CORS_ORIGIN || '*',
+  RETENTION_MS: Number(process.env.RETENTION_MS || 24 * 60 * 60 * 1000), // 24h
+  CLEANUP_INTERVAL_MS: Number(process.env.CLEANUP_INTERVAL_MS || 10 * 60 * 1000), // 10m
+  WS_PATH: process.env.WS_PATH || '/ws-chat',
+  BASE_PATH: process.env.CHAT_BASE_PATH || '/chat', // HTTP API mount path when app is provided
+};
 
 /* ---------- Files ---------- */
 const DATA_DIR = path.join(__dirname, 'data');
-const MSG_FILE = path.join(DATA_DIR, 'chat.json');             // [{id,from,to,content,ts}]
-const UND_FILE = path.join(DATA_DIR, 'undelivered.json');      // { userId: [message,...] }
-const CONV_FILE = path.join(DATA_DIR, 'conversations.json');   // { userId: [{peerId,peerName,ts}] }
+const MSG_FILE = path.join(DATA_DIR, 'chat.json');           // [{id,from,to,content,ts}]
+const UND_FILE = path.join(DATA_DIR, 'undelivered.json');    // { userId: [message,...] }
+const CONV_FILE = path.join(DATA_DIR, 'conversations.json'); // { userId: [{peerId,peerName,ts}] }
 
 function ensureFile(file, init) {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -37,11 +42,9 @@ const writeJson = (file, obj) => fs.writeFileSync(file, JSON.stringify(obj, null
 /* ---------- Stores ---------- */
 function loadMessages() { return readJson(MSG_FILE, '[]'); }
 function saveMessages(list) { writeJson(MSG_FILE, list); }
-function addMessage(msg) {
-  const list = loadMessages(); list.push(msg); saveMessages(list);
-}
-function cleanupMessages() {
-  const cutoff = Date.now() - RETENTION_MS;
+function addMessage(msg) { const list = loadMessages(); list.push(msg); saveMessages(list); }
+function cleanupMessages(retentionMs) {
+  const cutoff = Date.now() - retentionMs;
   const list = loadMessages();
   const keep = list.filter(m => new Date(m.ts).getTime() > cutoff);
   if (keep.length !== list.length) saveMessages(keep);
@@ -70,11 +73,9 @@ function touchConversation(userId, peerId, peerName) {
   if (!convs[userId]) convs[userId] = [];
   const arr = convs[userId];
   const now = Date.now();
-
   const i = arr.findIndex(x => x.peerId === peerId);
   if (i === -1) arr.unshift({ peerId, peerName: peerName || '', ts: now });
   else {
-    // move to top + update name/time
     const updated = { ...arr[i], peerName: peerName || arr[i].peerName, ts: now };
     arr.splice(i, 1);
     arr.unshift(updated);
@@ -82,122 +83,161 @@ function touchConversation(userId, peerId, peerName) {
   saveConvs(convs);
 }
 
-/* ---------- App / IO ---------- */
-const app = express();
-app.use(express.json());
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: CORS_ORIGIN } });
-
-/* ---------- Auth (HTTP & Socket) ---------- */
-function verifyToken(bearer) {
+/* ---------- Auth helpers ---------- */
+function verifyTokenFromBearer(bearer, jwtSecret) {
   const token = (bearer || '').replace(/^Bearer\s+/i, '');
   if (!token) throw new Error('missing_token');
-  return jwt.verify(token, JWT_SECRET);
+  return jwt.verify(token, jwtSecret);
 }
-function httpAuth(req, res, next) {
-  try {
-    const payload = verifyToken(req.headers.authorization || '');
-    req.user = payload;
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'invalid_token', details: e.message });
-  }
-}
-io.use((socket, next) => {
-  try {
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    const payload = verifyToken(`Bearer ${token}`);
-    socket.user = payload;
-    next();
-  } catch (e) { next(new Error('invalid_token')); }
-});
 
-/* ---------- Socket events ---------- */
-io.on('connection', (socket) => {
-  const me = socket.user;
-  if (!me?.id) return socket.disconnect();
+/* ============================================================
+ * initChat(httpServer, options)
+ * Attaches Socket.IO to an existing HTTP server and (optionally)
+ * mounts HTTP chat APIs onto an existing Express app.
+ * ============================================================ */
+function initChat(
+  httpServer,
+  {
+    app,                         // optional: pass your Express app to mount HTTP APIs
+    jwtSecret = DEFAULTS.JWT_SECRET,
+    path = DEFAULTS.WS_PATH,     // WebSocket path (match on client)
+    corsOrigin = DEFAULTS.CORS_ORIGIN,
+    basePath = DEFAULTS.BASE_PATH, // HTTP APIs mount path (e.g., '/chat')
+    retentionMs = DEFAULTS.RETENTION_MS,
+    cleanupIntervalMs = DEFAULTS.CLEANUP_INTERVAL_MS,
+  } = {}
+) {
+  // --- Socket.IO ---
+  const io = new Server(httpServer, {
+    path,
+    cors: { origin: corsOrigin },
+  });
 
-  const room = `user:${me.id}`;
-  socket.join(room);
-  console.log(`🔵 CONNECT ${me.id}`);
-
-  // 1) Drain any queued undelivered messages
-  const queued = drainUndelivered(me.id);
-  if (queued.length) {
-    queued.forEach(m => socket.emit('message', m));
-  }
-  // 2) Tell clients I'm online (optional)
-  io.to(room).emit('presence', { userId: me.id, status: 'online' });
-
-  // Handle send
-  socket.on('message', (payload) => {
-    const { to, content, tempId, peerName } = payload || {};
-    if (!to || !content) return;
-
-    const msg = {
-      id: uuidv4(),
-      from: me.id,
-      to,
-      content,
-      ts: new Date().toISOString()
-    };
-
-    // persist
-    addMessage(msg);
-
-    // ensure both conversation lists updated (so first-time chats appear)
-    touchConversation(me.id, to, peerName || '');
-    touchConversation(to, me.id, me.name || '');
-
-    // deliver now if recipient is connected, else queue
-    const recipientRoom = `user:${to}`;
-    const roomSize = io.sockets.adapter.rooms.get(recipientRoom)?.size || 0;
-
-    if (roomSize > 0) {
-      io.to(recipientRoom).emit('message', msg);
-    } else {
-      queueUndelivered(to, msg);
+  // Socket auth
+  io.use((socket, next) => {
+    try {
+      const token =
+        socket.handshake.auth?.token ||
+        socket.handshake.query?.token ||
+        socket.handshake.headers?.authorization?.split(' ')[1];
+      if (!token) return next(new Error('invalid_token'));
+      const payload = jwt.verify(token, jwtSecret);
+      socket.user = payload;
+      next();
+    } catch {
+      next(new Error('invalid_token'));
     }
-
-    // ACK back to sender
-    socket.emit('message:sent', { tempId: tempId || null, serverId: msg.id, ts: msg.ts });
-    console.log(`💬 ${msg.from} -> ${msg.to}: ${msg.content}${roomSize ? '' : ' (queued)'}`);
   });
 
-  socket.on('disconnect', () => {
-    console.log(`🔴 DISCONNECT ${me.id}`);
-    // optional presence event
-    io.to(room).emit('presence', { userId: me.id, status: 'offline' });
+  // Socket events
+  io.on('connection', (socket) => {
+    const me = socket.user;
+    if (!me?.id) return socket.disconnect();
+
+    const room = `user:${me.id}`;
+    socket.join(room);
+    const queued = drainUndelivered(me.id);
+    queued.forEach(m => socket.emit('message', m));
+    io.to(room).emit('presence', { userId: me.id, status: 'online' });
+
+    socket.on('message', (payload) => {
+      const { to, content, tempId, peerName } = payload || {};
+      if (!to || !content) return;
+
+      const msg = {
+        id: uuidv4(),
+        from: me.id,
+        to,
+        content,
+        ts: new Date().toISOString(),
+      };
+
+      addMessage(msg);
+      touchConversation(me.id, to, peerName || '');
+      touchConversation(to, me.id, me.name || '');
+
+      const recipientRoom = `user:${to}`;
+      const roomSize = io.sockets.adapter.rooms.get(recipientRoom)?.size || 0;
+      if (roomSize > 0) io.to(recipientRoom).emit('message', msg);
+      else queueUndelivered(to, msg);
+
+      socket.emit('message:sent', { tempId: tempId || null, serverId: msg.id, ts: msg.ts });
+      // console.log(`💬 ${msg.from} -> ${msg.to}: ${msg.content}${roomSize ? '' : ' (queued)'}`);
+    });
+
+    socket.on('disconnect', () => {
+      io.to(room).emit('presence', { userId: me.id, status: 'offline' });
+    });
   });
-});
 
-/* ---------- HTTP APIs ---------- */
-// Health
-app.get('/health', (req, res) => res.json({ ok: true }));
+  // Cleanup task
+  const timer = setInterval(() => cleanupMessages(retentionMs), cleanupIntervalMs);
+  timer.unref?.();
 
-// Conversations for Home
-app.get('/conversations/:userId', httpAuth, (req, res) => {
-  const convs = loadConvs();
-  res.json(convs[req.params.userId] || []);
-});
+  // --- Optional HTTP APIs on existing app ---
+  if (app && typeof app.use === 'function') {
+    const router = express.Router();
 
-// History between two users (within retention)
-app.get('/messages', httpAuth, (req, res) => {
-  const { userA, userB } = req.query;
-  if (!userA || !userB) return res.status(400).json({ error: 'missing_params' });
-  const now = Date.now();
-  const msgs = loadMessages().filter(m => {
-    const inPair = (m.from === userA && m.to === userB) || (m.from === userB && m.to === userA);
-    const fresh = now - new Date(m.ts).getTime() <= RETENTION_MS;
-    return inPair && fresh;
+    // simple HTTP auth middleware that uses the same JWT
+    router.use((req, res, next) => {
+      try {
+        const payload = verifyTokenFromBearer(req.headers.authorization || '', jwtSecret);
+        req.user = payload;
+        next();
+      } catch (e) {
+        res.status(401).json({ error: 'invalid_token', details: e.message });
+      }
+    });
+
+    // Health
+    router.get('/health', (_req, res) => res.json({ ok: true }));
+
+    // Conversations for Home
+    router.get('/conversations/:userId', (req, res) => {
+      const convs = loadConvs();
+      res.json(convs[req.params.userId] || []);
+    });
+
+    // History between two users (within retention)
+    router.get('/messages', (req, res) => {
+      const { userA, userB } = req.query;
+      if (!userA || !userB) return res.status(400).json({ error: 'missing_params' });
+      const now = Date.now();
+      const msgs = loadMessages().filter(m => {
+        const inPair = (m.from === userA && m.to === userB) || (m.from === userB && m.to === userA);
+        const fresh = now - new Date(m.ts).getTime() <= retentionMs;
+        return inPair && fresh;
+      });
+      res.json({ ok: true, messages: msgs });
+    });
+
+    app.use(basePath, router);
+  }
+
+  console.log('✅ Chat server initialized (Socket.IO).');
+  return io;
+}
+
+module.exports = { initChat };
+
+/* ============================================================
+ * Standalone mode (optional):
+ * If you run: node chat-server.js
+ * it will create its own Express app and listen by itself.
+ * ============================================================ */
+if (require.main === module) {
+  const app = express();
+  app.use(express.json());
+  const server = http.createServer(app);
+  initChat(server, {
+    app,
+    jwtSecret: DEFAULTS.JWT_SECRET,
+    path: DEFAULTS.WS_PATH,
+    corsOrigin: DEFAULTS.CORS_ORIGIN,
+    basePath: DEFAULTS.BASE_PATH,
   });
-  res.json({ ok: true, messages: msgs });
-});
+  server.listen(DEFAULTS.PORT, () => {
+    console.log(`🚀 Chat server running on ${DEFAULTS.PORT}`);
+  });
+}
 
-/* ---------- Cleanup timer ---------- */
-setInterval(cleanupMessages, CLEANUP_INTERVAL_MS);
-
-/* ---------- Start ---------- */
-server.listen(PORT, () => {
-  console.log(`🚀 Chat server running on ${PORT}`);
-});
