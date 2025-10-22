@@ -1,0 +1,13 @@
+# Environment / credentials
+
+service_account.json
+
+# Virtual environments
+venv/
+__pycache__/
+*.pyc
+
+# IDE / cache files
+.vscode/
+*.log
+*.sqlite3

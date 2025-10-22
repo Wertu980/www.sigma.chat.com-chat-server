@@ -1,1 +1,0 @@
-# https://wwwsigmachatcom.vercel.app

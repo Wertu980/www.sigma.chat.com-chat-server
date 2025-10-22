@@ -1,0 +1,35 @@
+# FastAPI + Database + Auth + Google Drive + Utilities
+alembic==1.14.0
+fastapi==0.115.6
+uvicorn==0.32.1
+uvicorn-worker==0.2.0
+
+# PostgreSQL Drivers (Neon compatible)
+psycopg==3.2.3
+psycopg-binary==3.2.3
+psycopg2-binary==2.9.10
+
+# ORM
+sqlalchemy==2.0.36
+
+# Environment and configuration
+python-dotenv==1.0.1
+
+# Auth & Security
+passlib==1.7.4
+pyjwt-key-fetcher==0.8.0
+
+# Data Validation
+pydantic==2.10.3
+pydantic-core==2.27.1
+
+# Phone validation (global)
+phonenumbers==8.13.51
+phonenumberchecker>=0.0.5
+
+# Google Drive Integration
+google-api-core==2.23.0
+google-api-python-client==2.154.0
+google-auth==2.36.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
